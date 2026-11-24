@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_FAIL, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -423,13 +423,29 @@ pub(crate) extern "system" fn create_compute_x(
             } else {
                 "wave64"
             };
+            let code_size = fspx.program.map(|p| p.len()).unwrap_or(0);
             tracing::info!(
                 threads = ?threads,
                 wave,
-                code_size = fspx.program.map(|p| p.len()).unwrap_or(0),
+                code_size,
                 total_size = fspx.total_size,
                 "CreateComputePipelineStateX (slot 62) called for FSPX compute module"
             );
+            if std::env::var("VICTORY_FSPX_REJECT_SLOT62")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                tracing::warn!(
+                    threads = ?threads,
+                    wave,
+                    "VICTORY_FSPX_REJECT_SLOT62 active: rejecting FSPX compute module in slot 62 with E_FAIL (0x80004005)"
+                );
+                if !out.is_null() {
+                    // SAFETY: out pointer passed by caller.
+                    unsafe { *out = std::ptr::null(); }
+                }
+                return E_FAIL;
+            }
         }
     }
     create_compute(this, desc, iid, out)
@@ -457,28 +473,88 @@ pub(crate) extern "system" fn deserialize_compute_x(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: out pointer passed by caller.
+        unsafe { *out = std::ptr::null(); }
+    }
+
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
 
+    let mut threads = [0, 0, 0];
+    let mut wave = "wave64";
     if !desc.kind0.is_null() && desc.kind0_size >= 28 {
         // SAFETY: checked non-null and size >= 28 bytes.
         let k0 = unsafe { std::slice::from_raw_parts(desc.kind0, desc.kind0_size) };
         let w3 = u32::from_le_bytes(k0[12..16].try_into().unwrap_or_default());
         let w4 = u32::from_le_bytes(k0[16..20].try_into().unwrap_or_default());
         let wave32 = (w4 & (1 << 20)) != 0;
-        let wave = if wave32 { "wave32" } else { "wave64" };
-        let threads = [w3 & 0xffff, (w3 >> 16) & 0xffff, w4 & 0xffff];
-        tracing::info!(
-            threads = ?threads,
-            wave,
-            kind0_size = desc.kind0_size,
-            kind6_size = desc.kind6_size,
-            "DeserializeComputePipelineStateX (slot 67) called for FSPX compute module"
-        );
+        wave = if wave32 { "wave32" } else { "wave64" };
+        threads = [w3 & 0xffff, (w3 >> 16) & 0xffff, w4 & 0xffff];
     }
 
+    // By default in this experimental branch, return E_FAIL (0x80004005) instead of E_NOTIMPL
+    // or S_OK to test if the caller (upscaler DLL or game engine) falls back to native/DXIL.
+    // Can be overridden via VICTORY_SLOT67_HR: "E_FAIL" (default), "E_INVALIDARG", "E_NOTIMPL", "S_OK".
+    let hr_override = std::env::var("VICTORY_SLOT67_HR").unwrap_or_else(|_| "E_FAIL".to_string());
+    match hr_override.to_ascii_uppercase().as_str() {
+        "E_FAIL" | "0X80004005" => {
+            tracing::warn!(
+                threads = ?threads,
+                wave,
+                kind0_size = desc.kind0_size,
+                kind6_size = desc.kind6_size,
+                "DeserializeComputePipelineStateX (slot 67) called for FSPX; returning E_FAIL (0x80004005) to force DXIL fallback"
+            );
+            E_FAIL
+        }
+        "E_INVALIDARG" | "0X80070057" => {
+            tracing::warn!(
+                threads = ?threads,
+                wave,
+                kind0_size = desc.kind0_size,
+                kind6_size = desc.kind6_size,
+                "DeserializeComputePipelineStateX (slot 67) called for FSPX; returning E_INVALIDARG (0x80070057) to force DXIL fallback"
+            );
+            E_INVALIDARG
+        }
+        "E_NOTIMPL" | "0X80004001" => {
+            tracing::warn!(
+                threads = ?threads,
+                wave,
+                kind0_size = desc.kind0_size,
+                kind6_size = desc.kind6_size,
+                "DeserializeComputePipelineStateX (slot 67) called for FSPX; returning E_NOTIMPL (0x80004001)"
+            );
+            E_NOTIMPL
+        }
+        "S_OK" | "0" => {
+            tracing::info!(
+                threads = ?threads,
+                wave,
+                kind0_size = desc.kind0_size,
+                kind6_size = desc.kind6_size,
+                "DeserializeComputePipelineStateX (slot 67) called for FSPX; assembling synthetic pipeline (S_OK)"
+            );
+            assemble_fspx_pipeline(desc, iid, out)
+        }
+        other => {
+            tracing::warn!(
+                hr = other,
+                "unknown VICTORY_SLOT67_HR value; defaulting to E_FAIL (0x80004005)"
+            );
+            E_FAIL
+        }
+    }
+}
+
+pub(crate) fn assemble_fspx_pipeline(
+    desc: &DeserializeComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     // Assemble the synthetic FSPX container payload from the parts:
     let total_size = (0x100 + desc.kind6_size + desc.kind7_size) as u32;
     let mut payload = Vec::with_capacity(total_size as usize);
@@ -804,7 +880,7 @@ mod tests {
         };
 
         let mut p = std::ptr::null();
-        let hr = deserialize_compute_x(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        let hr = assemble_fspx_pipeline(&desc, &PIPELINE_IIDS[0], &mut p);
         assert_eq!(hr, S_OK);
         assert!(!p.is_null());
 
@@ -820,5 +896,33 @@ mod tests {
         assert!(info.wave32);
 
         object::release_boxed::<Pipeline>(p);
+    }
+
+    #[test]
+    fn deserialize_compute_x_default_returns_e_fail() {
+        let desc = DeserializeComputeHead {
+            root: std::ptr::null(),
+            kind0: std::ptr::null(),
+            kind0_size: 0,
+            kind1: std::ptr::null(),
+            kind1_size: 0,
+            kind6: std::ptr::null(),
+            kind6_size: 0,
+            kind7: std::ptr::null(),
+            kind7_size: 0,
+        };
+
+        let mut p = 0x1234 as This;
+        let hr = deserialize_compute_x(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, E_FAIL);
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn deserialize_compute_x_null_desc_returns_e_invalidarg() {
+        let mut p = 0x1234 as This;
+        let hr = deserialize_compute_x(std::ptr::null(), std::ptr::null(), &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(p.is_null());
     }
 }
