@@ -188,7 +188,19 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    if container.starts_with(crate::dxbc::Fspx::MAGIC) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "bare FSPX compute module (requires native FSPX RDNA2 translator)",
+        });
+    }
     let c = Container::parse(container)?;
+    if c.fspx().is_some() {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "FSPX compute module in ACCC container (requires native FSPX RDNA2 translator)",
+        });
+    }
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
@@ -745,5 +757,23 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn translate_identifies_fspx_compute_containers() {
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&0u32.to_le_bytes()); // count 0
+        fspx.extend_from_slice(&16u32.to_le_bytes()); // total size 16
+
+        // Bare FSPX payload
+        let err = super::translate(&fspx).unwrap_err();
+        assert!(matches!(err, ShaderError::Unsupported { what, .. } if what.contains("bare FSPX")));
+
+        // DXBC container wrapping FSPX in ACCC part
+        let dxbc = crate::dxbc::build(&[(super::FourCC::ACCC, &fspx)]);
+        let err = super::translate(&dxbc).unwrap_err();
+        assert!(matches!(err, ShaderError::Unsupported { what, .. } if what.contains("ACCC container")));
     }
 }

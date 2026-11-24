@@ -28,6 +28,8 @@ impl FourCC {
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
+    /// ACCC chunk holding an FSPX precompiled compute payload.
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
 }
 
 impl std::fmt::Debug for FourCC {
@@ -109,6 +111,122 @@ impl<'a> Container<'a> {
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
+
+    /// If this container holds an FSPX compute payload in its ACCC part.
+    pub fn fspx(&self) -> Option<Fspx<'a>> {
+        let part = self.part(FourCC::ACCC)?;
+        if part.data.starts_with(Fspx::MAGIC) {
+            Fspx::parse(part.data).ok()
+        } else {
+            None
+        }
+    }
+}
+
+/// An FSPX payload header and its directory of entries.
+#[derive(Debug, Clone)]
+pub struct Fspx<'a> {
+    pub version: u32,
+    pub count: u32,
+    pub total_size: u32,
+    /// Kind 0: dispatch state (28 bytes).
+    pub dispatch_state: Option<&'a [u8]>,
+    /// Kind 1: unknown (20 bytes).
+    pub kind1: Option<&'a [u8]>,
+    /// Kind 6: precompiled RDNA2 compute program (with 36-byte prologue).
+    pub program: Option<&'a [u8]>,
+    /// Kind 7: resource and hash records.
+    pub records: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchInfo {
+    pub threads: [u32; 3],
+    pub wave32: bool,
+    pub rsrc1: u32,
+    pub rsrc2: u32,
+}
+
+impl<'a> Fspx<'a> {
+    pub const MAGIC: &'static [u8; 4] = b"FSPX";
+
+    pub fn parse(data: &'a [u8]) -> Result<Self, ShaderError> {
+        if data.len() < 16 || &data[0..4] != Self::MAGIC {
+            return Err(ShaderError::Malformed("not an FSPX payload"));
+        }
+        let version = u32_at(data, 4)?;
+        let count = u32_at(data, 8)?;
+        let total_size = u32_at(data, 12)?;
+        if total_size as usize > data.len() || total_size < 16 {
+            return Err(ShaderError::Malformed("FSPX total size out of bounds"));
+        }
+        if 16 + (count as usize) * 16 > total_size as usize {
+            return Err(ShaderError::Malformed("FSPX entry directory out of bounds"));
+        }
+        let mut dispatch_state = None;
+        let mut kind1 = None;
+        let mut program = None;
+        let mut records = None;
+        for i in 0..count as usize {
+            let entry_offset = 16 + i * 16;
+            let kind = u32_at(data, entry_offset)?;
+            let offset = u32_at(data, entry_offset + 4)? as usize;
+            let size = u32_at(data, entry_offset + 8)? as usize;
+            if offset + size > total_size as usize {
+                continue;
+            }
+            let entry_data = &data[offset..offset + size];
+            match kind {
+                0 => dispatch_state = Some(entry_data),
+                1 => kind1 = Some(entry_data),
+                6 => program = Some(entry_data),
+                7 => records = Some(entry_data),
+                _ => {}
+            }
+        }
+        Ok(Fspx {
+            version,
+            count,
+            total_size,
+            dispatch_state,
+            kind1,
+            program,
+            records,
+        })
+    }
+
+    /// Parsed dispatch state (kind 0): (threads_x, threads_y, threads_z, wave32, rsrc1, rsrc2).
+    pub fn dispatch_info(&self) -> Option<DispatchInfo> {
+        let state = self.dispatch_state?;
+        if state.len() < 28 {
+            return None;
+        }
+        let w3 = u32::from_le_bytes(state[12..16].try_into().ok()?);
+        let w4 = u32::from_le_bytes(state[16..20].try_into().ok()?);
+        let threads_x = w3 & 0xffff;
+        let threads_y = (w3 >> 16) & 0xffff;
+        let threads_z = w4 & 0xffff;
+        let wave32 = (w4 & (1 << 20)) != 0;
+        let rsrc1 = u32::from_le_bytes(state[20..24].try_into().ok()?);
+        let rsrc2 = u32::from_le_bytes(state[24..28].try_into().ok()?);
+        Some(DispatchInfo {
+            threads: [threads_x, threads_y, threads_z],
+            wave32,
+            rsrc1,
+            rsrc2,
+        })
+    }
+}
+
+/// Checks whether a byte slice is an FSPX payload or a DXBC container containing an FSPX ACCC chunk.
+pub fn inspect_fspx(bytes: &[u8]) -> Option<Fspx<'_>> {
+    if bytes.starts_with(Fspx::MAGIC) {
+        return Fspx::parse(bytes).ok();
+    }
+    if let Ok(c) = Container::parse(bytes) {
+        return c.fspx();
+    }
+    None
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -177,5 +295,90 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn parses_fspx_payload_and_dispatch_state() {
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes()); // version
+        fspx.extend_from_slice(&4u32.to_le_bytes()); // count
+        let total_size = 0x140u32;
+        fspx.extend_from_slice(&total_size.to_le_bytes());
+        // 4 directory entries:
+        // kind 0 at 0x50, size 28
+        fspx.extend_from_slice(&0u32.to_le_bytes());
+        fspx.extend_from_slice(&0x50u32.to_le_bytes());
+        fspx.extend_from_slice(&28u32.to_le_bytes());
+        fspx.extend_from_slice(&0u32.to_le_bytes());
+        // kind 1 at 0x70, size 20
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&0x70u32.to_le_bytes());
+        fspx.extend_from_slice(&20u32.to_le_bytes());
+        fspx.extend_from_slice(&0u32.to_le_bytes());
+        // kind 6 at 0x100, size 48
+        fspx.extend_from_slice(&6u32.to_le_bytes());
+        fspx.extend_from_slice(&0x100u32.to_le_bytes());
+        fspx.extend_from_slice(&48u32.to_le_bytes());
+        fspx.extend_from_slice(&0u32.to_le_bytes());
+        // kind 7 at 0x130, size 16
+        fspx.extend_from_slice(&7u32.to_le_bytes());
+        fspx.extend_from_slice(&0x130u32.to_le_bytes());
+        fspx.extend_from_slice(&16u32.to_le_bytes());
+        fspx.extend_from_slice(&0u32.to_le_bytes());
+
+        // Pad to 0x50:
+        fspx.resize(0x50, 0);
+        // Kind 0 dispatch state (28 bytes):
+        // w0, w1, w2 = 0
+        fspx.extend_from_slice(&[0u8; 12]);
+        // w3: numthreads_x = 8, numthreads_y = 16
+        fspx.extend_from_slice(&(8u32 | (16u32 << 16)).to_le_bytes());
+        // w4: numthreads_z = 1, bit 20 set = wave32
+        fspx.extend_from_slice(&(1u32 | (1u32 << 20)).to_le_bytes());
+        // w5: rsrc1
+        fspx.extend_from_slice(&0x000000C0u32.to_le_bytes());
+        // w6: rsrc2
+        fspx.extend_from_slice(&0x00000400u32.to_le_bytes());
+
+        // Pad to 0x70:
+        fspx.resize(0x70, 0);
+        // Kind 1: 20 bytes
+        fspx.extend_from_slice(&[1u8; 20]);
+
+        // Pad to 0x100:
+        fspx.resize(0x100, 0);
+        // Kind 6: 48 bytes
+        fspx.extend_from_slice(&[0xaa; 48]);
+
+        // Pad to 0x130:
+        fspx.resize(0x130, 0);
+        // Kind 7: 16 bytes
+        fspx.extend_from_slice(&[0xbb; 16]);
+
+        let parsed = Fspx::parse(&fspx).expect("valid FSPX");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.count, 4);
+        assert_eq!(parsed.total_size, 0x140);
+        assert_eq!(parsed.program.unwrap(), &[0xaa; 48]);
+        assert_eq!(parsed.records.unwrap(), &[0xbb; 16]);
+
+        let info = parsed.dispatch_info().expect("valid dispatch info");
+        assert_eq!(info.threads, [8, 16, 1]);
+        assert!(info.wave32);
+        assert_eq!(info.rsrc1, 0x000000C0);
+        assert_eq!(info.rsrc2, 0x00000400);
+
+        // Test inspect_fspx on bare payload
+        assert!(inspect_fspx(&fspx).is_some());
+
+        // Test inspect_fspx on DXBC container holding ACCC part
+        let dxbc_container = build(&[(FourCC::ACCC, &fspx), (FourCC::HASH, &[7; 16])]);
+        let container = Container::parse(&dxbc_container).expect("DXBC container");
+        let inner_fspx = container.fspx().expect("ACCC holds FSPX");
+        assert_eq!(inner_fspx.dispatch_info().unwrap().threads, [8, 16, 1]);
+
+        let inspected = inspect_fspx(&dxbc_container).expect("inspect finds ACCC FSPX");
+        assert_eq!(inspected.dispatch_info().unwrap().threads, [8, 16, 1]);
     }
 }

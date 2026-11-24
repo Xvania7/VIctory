@@ -107,6 +107,25 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                if let Some(fspx) = victory_shader::dxbc::inspect_fspx(&self.container) {
+                    let info = fspx.dispatch_info();
+                    let threads = info.map(|i| i.threads).unwrap_or([0, 0, 0]);
+                    let wave = if info.map(|i| i.wave32).unwrap_or(false) {
+                        "wave32"
+                    } else {
+                        "wave64"
+                    };
+                    let code_size = fspx.program.map(|p| p.len()).unwrap_or(0);
+                    tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        threads = ?threads,
+                        wave,
+                        code_size,
+                        total_size = fspx.total_size,
+                        "FSPX AOT compute module detected; host shader generation requires FSPX RDNA2 translation (dispatches dropped)"
+                    );
+                }
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
@@ -132,6 +151,19 @@ impl Shader {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
+    if let Some(fspx) = victory_shader::dxbc::inspect_fspx(container) {
+        let info = fspx.dispatch_info();
+        let threads = info.map(|i| i.threads).unwrap_or([0, 0, 0]);
+        let wave = if info.map(|i| i.wave32).unwrap_or(false) {
+            "wave32"
+        } else {
+            "wave64"
+        };
+        let code_size = fspx.program.map(|p| p.len()).unwrap_or(0);
+        return Err(format!(
+            "FSPX AOT compute module (threads={threads:?}, {wave}, code_size={code_size}): requires native RDNA2 decompiler"
+        ));
+    }
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
@@ -364,7 +396,7 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
-/// Device method 0x1f0: the plain compute description plus console
+/// Device method 0x1f0 (slot 62): the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
 /// the rest of the description.
@@ -376,7 +408,134 @@ pub(crate) extern "system" fn create_compute_x(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // SAFETY: the title passes a description pointer if non-null.
+    if let Some(desc_ref) = (unsafe { desc.as_ref() })
+        && !desc_ref.stage.code.is_null()
+        && desc_ref.stage.size >= 4
+    {
+        // SAFETY: stage.code points to stage.size bytes passed by caller.
+        let bytes = unsafe { std::slice::from_raw_parts(desc_ref.stage.code, desc_ref.stage.size) };
+        if let Some(fspx) = victory_shader::dxbc::inspect_fspx(bytes) {
+            let info = fspx.dispatch_info();
+            let threads = info.map(|i| i.threads).unwrap_or([0, 0, 0]);
+            let wave = if info.map(|i| i.wave32).unwrap_or(false) {
+                "wave32"
+            } else {
+                "wave64"
+            };
+            tracing::info!(
+                threads = ?threads,
+                wave,
+                code_size = fspx.program.map(|p| p.len()).unwrap_or(0),
+                total_size = fspx.total_size,
+                "CreateComputePipelineStateX (slot 62) called for FSPX compute module"
+            );
+        }
+    }
     create_compute(this, desc, iid, out)
+}
+
+#[repr(C)]
+pub(crate) struct DeserializeComputeHead {
+    root: This,
+    kind0: *const u8,
+    kind0_size: usize,
+    kind1: *const u8,
+    kind1_size: usize,
+    kind6: *const u8,
+    kind6_size: usize,
+    kind7: *const u8,
+    kind7_size: usize,
+}
+
+/// Device method slot 67 (0x218): `DeserializeComputePipelineStateX(desc, iid, out)`.
+/// Called by `amd_fidelityfx_upscaler_xbox.dll` (FSR4/upscaler/post-process) with precompiled
+/// RDNA2 compute programs.
+pub(crate) extern "system" fn deserialize_compute_x(
+    _this: This,
+    desc: *const DeserializeComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+
+    if !desc.kind0.is_null() && desc.kind0_size >= 28 {
+        // SAFETY: checked non-null and size >= 28 bytes.
+        let k0 = unsafe { std::slice::from_raw_parts(desc.kind0, desc.kind0_size) };
+        let w3 = u32::from_le_bytes(k0[12..16].try_into().unwrap_or_default());
+        let w4 = u32::from_le_bytes(k0[16..20].try_into().unwrap_or_default());
+        let wave32 = (w4 & (1 << 20)) != 0;
+        let wave = if wave32 { "wave32" } else { "wave64" };
+        let threads = [w3 & 0xffff, (w3 >> 16) & 0xffff, w4 & 0xffff];
+        tracing::info!(
+            threads = ?threads,
+            wave,
+            kind0_size = desc.kind0_size,
+            kind6_size = desc.kind6_size,
+            "DeserializeComputePipelineStateX (slot 67) called for FSPX compute module"
+        );
+    }
+
+    // Assemble the synthetic FSPX container payload from the parts:
+    let total_size = (0x100 + desc.kind6_size + desc.kind7_size) as u32;
+    let mut payload = Vec::with_capacity(total_size as usize);
+    payload.extend_from_slice(b"FSPX");
+    payload.extend_from_slice(&1u32.to_le_bytes()); // version
+    payload.extend_from_slice(&4u32.to_le_bytes()); // count
+    payload.extend_from_slice(&total_size.to_le_bytes());
+
+    // Directory (4 * 16 bytes):
+    payload.extend_from_slice(&0u32.to_le_bytes()); // kind 0
+    payload.extend_from_slice(&0x50u32.to_le_bytes());
+    payload.extend_from_slice(&(desc.kind0_size as u32).to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    payload.extend_from_slice(&1u32.to_le_bytes()); // kind 1
+    payload.extend_from_slice(&(0x50 + desc.kind0_size as u32).to_le_bytes());
+    payload.extend_from_slice(&(desc.kind1_size as u32).to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    payload.extend_from_slice(&6u32.to_le_bytes()); // kind 6
+    payload.extend_from_slice(&0x100u32.to_le_bytes());
+    payload.extend_from_slice(&(desc.kind6_size as u32).to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    payload.extend_from_slice(&7u32.to_le_bytes()); // kind 7
+    payload.extend_from_slice(&(0x100 + desc.kind6_size as u32).to_le_bytes());
+    payload.extend_from_slice(&(desc.kind7_size as u32).to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    if !desc.kind0.is_null() && desc.kind0_size > 0 {
+        // SAFETY: checked non-null and size > 0.
+        payload.extend_from_slice(unsafe { std::slice::from_raw_parts(desc.kind0, desc.kind0_size) });
+    }
+    if !desc.kind1.is_null() && desc.kind1_size > 0 {
+        // SAFETY: checked non-null and size > 0.
+        payload.extend_from_slice(unsafe { std::slice::from_raw_parts(desc.kind1, desc.kind1_size) });
+    }
+    if payload.len() < 0x100 {
+        payload.resize(0x100, 0);
+    }
+    if !desc.kind6.is_null() && desc.kind6_size > 0 {
+        // SAFETY: checked non-null and size > 0.
+        payload.extend_from_slice(unsafe { std::slice::from_raw_parts(desc.kind6, desc.kind6_size) });
+    }
+    if !desc.kind7.is_null() && desc.kind7_size > 0 {
+        // SAFETY: checked non-null and size > 0.
+        payload.extend_from_slice(unsafe { std::slice::from_raw_parts(desc.kind7, desc.kind7_size) });
+    }
+
+    let shaders = vec![shader("compute", &payload)];
+    hand_out(
+        shaders,
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -620,5 +779,46 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn deserialize_compute_x_assembles_fspx_pipeline() {
+        let mut k0 = [0u8; 28];
+        k0[12..16].copy_from_slice(&(8u32 | (16u32 << 16)).to_le_bytes());
+        k0[16..20].copy_from_slice(&(1u32 | (1u32 << 20)).to_le_bytes());
+
+        let k1 = [1u8; 20];
+        let code = [0x55u8; 64];
+        let k7 = [0x77u8; 16];
+
+        let desc = DeserializeComputeHead {
+            root: std::ptr::null(),
+            kind0: k0.as_ptr(),
+            kind0_size: k0.len(),
+            kind1: k1.as_ptr(),
+            kind1_size: k1.len(),
+            kind6: code.as_ptr(),
+            kind6_size: code.len(),
+            kind7: k7.as_ptr(),
+            kind7_size: k7.len(),
+        };
+
+        let mut p = std::ptr::null();
+        let hr = deserialize_compute_x(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, S_OK);
+        assert!(!p.is_null());
+
+        let pipe = pipeline(p);
+        assert_eq!(pipe.shaders.len(), 1);
+        let s = &pipe.shaders[0];
+        assert_eq!(s.stage, "compute");
+
+        let fspx = victory_shader::dxbc::inspect_fspx(&s.container).expect("valid assembled FSPX");
+        assert_eq!(fspx.program.unwrap(), &code);
+        let info = fspx.dispatch_info().unwrap();
+        assert_eq!(info.threads, [8, 16, 1]);
+        assert!(info.wave32);
+
+        object::release_boxed::<Pipeline>(p);
     }
 }

@@ -80,7 +80,13 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .shaders
                 .iter()
                 .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
+                .map(|s| {
+                    if victory_shader::dxbc::inspect_fspx(&s.container).is_some() {
+                        format!("{} {} (FSPX compute module)", s.stage, s.hash)
+                    } else {
+                        format!("{} {}", s.stage, s.hash)
+                    }
+                })
                 .collect();
             Some(if failed.is_empty() {
                 format!("refused {:?}", p.shaders)
