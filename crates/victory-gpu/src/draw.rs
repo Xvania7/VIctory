@@ -493,19 +493,39 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
+                    let root_entry = self.roots_ref(compute).get(usize::from(slot));
+                    let Some(Root::View(address)) = root_entry else {
+                        once!(
+                            stage = stage.shader.stage,
+                            slot,
+                            ?root_entry,
+                            "a shader reads a root view the title did not set as a view"
+                        );
                         continue;
                     };
                     let Some(gpu) = root_view(list, *address, srv) else {
+                        once!(
+                            stage = stage.shader.stage,
+                            address = format_args!("{address:#x}"),
+                            srv,
+                            "root view address has no host memory / shadow buffer"
+                        );
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
                         match (compute, srv) {
                             (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (false, true) => {
+                                #[cfg(feature = "diagnostics")]
+                                tracing::trace!(
+                                    stage = stage.shader.stage,
+                                    slot,
+                                    address = format_args!("{address:#x}"),
+                                    "bound graphics root SRV"
+                                );
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
                             (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
@@ -823,11 +843,23 @@ impl State {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
                         describe(crate::descriptor::view(handle).as_ref())
                     }
-                    (root, _) => format!("{root:?}"),
+                    (RootType::Table, other) => format!("Table(unset: {other:?})"),
+                    (RootType::Descriptor, Some(Root::View(address))) => {
+                        let has_shadow = crate::shadow::find(*address, 1).is_some();
+                        if has_shadow {
+                            format!("Descriptor(view {address:#x})")
+                        } else {
+                            format!("Descriptor(view {address:#x}, no shadow)")
+                        }
+                    }
+                    (RootType::Descriptor, other) => {
+                        format!("Descriptor(missing view: {other:?})")
+                    }
+                    (root, entry) => format!("{root:?} (slot: {entry:?})"),
                 };
                 out.push(format!(
-                    "{} {:?} s{}+{}: {what}",
-                    stage.shader.hash, u.kind, u.slot, u.table_offset_dwords
+                    "{} {} {:?} s{}+{}: {what}",
+                    stage.shader.stage, stage.shader.hash, u.kind, u.slot, u.table_offset_dwords
                 ));
             }
         }
