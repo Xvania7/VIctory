@@ -521,4 +521,356 @@ mod tests {
         assert_eq!(error, INVALID_STREAM);
         assert_eq!(XApuDisconnect(handle), S_OK);
     }
+
+    #[test]
+    fn decodes_opus_mono_stream_with_waveform_fidelity() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 4,
+            commands_per_stream: 4,
+            memory: 0x10_0000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+
+        let activate = Activate {
+            id: id(ACTIVATE, 1),
+            channels: 1,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        // 960 samples (20 ms) of 1 kHz mono sine wave
+        let tone: Vec<f32> = (0..960)
+            .map(|i| (i as f32 * 1000.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.7)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+
+        // SAFETY: copying encoded packet into the allocated connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+        let out_ptr = base.wrapping_add(0x10000);
+        let process = Process {
+            id: id(PROCESS, 1),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: n as u32,
+            input: base,
+            output_length: 960 * 4,
+            output: out_ptr,
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const process).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // ACTIVATE
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // PROCESS
+
+        // SAFETY: initialized above by XApuDequeueResult.
+        let decoded = unsafe { result.assume_init() };
+        let (error, frames, length) = (decoded.error, decoded.frames, decoded.output_length);
+        assert_eq!((error, frames, length), (S_OK, 960, 960 * 4));
+
+        // SAFETY: the decoder wrote 960 mono frames into out_ptr.
+        let pcm = unsafe { std::slice::from_raw_parts(out_ptr.cast::<f32>(), 960) };
+        let energy: f32 = pcm.iter().map(|s| s * s).sum::<f32>() / 960.0;
+        assert!(energy > 0.1, "expected tone energy, got {energy}");
+
+        // Peak cross-correlation with lag compensation (accounting for Opus MDCT lookahead delay)
+        let n = 960 - 48;
+        let mut max_corr = 0.0f32;
+        for lag in 0..48 {
+            let mut dot = 0.0f32;
+            let mut norm_orig = 0.0f32;
+            let mut norm_dec = 0.0f32;
+            for i in 0..n {
+                let orig = tone[i];
+                let dec = pcm[i + lag];
+                dot += orig * dec;
+                norm_orig += orig * orig;
+                norm_dec += dec * dec;
+            }
+            let corr = dot / (norm_orig.sqrt() * norm_dec.sqrt());
+            if corr > max_corr {
+                max_corr = corr;
+            }
+        }
+        assert!(
+            max_corr > 0.80,
+            "Opus mono signal peak correlation with lag compensation {max_corr} > 0.80"
+        );
+
+        assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    #[test]
+    fn decodes_opus_deinterleaved_stereo_separation() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 4,
+            commands_per_stream: 4,
+            memory: 0x10_0000,
+            frames_per_output: 0,
+            options: DEINTERLEAVED_OUTPUT,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+
+        let activate = Activate {
+            id: id(ACTIVATE, 2),
+            channels: 2,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        // Left channel has a 440 Hz tone, Right channel is complete silence
+        let mut stereo = Vec::with_capacity(960 * 2);
+        for i in 0..960 {
+            let left = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.8;
+            let right = 0.0f32;
+            stereo.push(left);
+            stereo.push(right);
+        }
+
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&stereo, 960, &mut packet).unwrap();
+
+        // SAFETY: copying encoded stereo packet into the connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+        let out_ptr = base.wrapping_add(0x10000);
+        let process = Process {
+            id: id(PROCESS, 2),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: n as u32,
+            input: base,
+            output_length: 960 * 2 * 4,
+            output: out_ptr,
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const process).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // ACTIVATE
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // PROCESS
+
+        // SAFETY: initialized above by XApuDequeueResult.
+        let decoded = unsafe { result.assume_init() };
+        let (error, frames, length) = (decoded.error, decoded.frames, decoded.output_length);
+        assert_eq!((error, frames, length), (S_OK, 960, 960 * 2 * 4));
+
+        // Deinterleaved planar output: left is out[0..960], right is out[960..1920]
+        // SAFETY: the decoder wrote 1920 deinterleaved samples into out_ptr.
+        let pcm = unsafe { std::slice::from_raw_parts(out_ptr.cast::<f32>(), 1920) };
+        let energy_left: f32 = pcm[0..960].iter().map(|s| s * s).sum::<f32>() / 960.0;
+        let energy_right: f32 = pcm[960..1920].iter().map(|s| s * s).sum::<f32>() / 960.0;
+
+        assert!(
+            energy_left > 0.1,
+            "left channel must contain signal, energy={energy_left}"
+        );
+        assert!(
+            energy_right < 0.005,
+            "right channel must be near silence, energy={energy_right}"
+        );
+
+        assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    #[test]
+    fn decodes_opus_frame_trimming_and_reset() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 4,
+            commands_per_stream: 4,
+            memory: 0x10_0000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+
+        let activate = Activate {
+            id: id(ACTIVATE, 0),
+            channels: 2,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+
+        // SAFETY: copying encoded packet into connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+        let out_ptr = base.wrapping_add(0x10000);
+
+        // Request trim: skip first 240 frames, keep 480 frames
+        let trim_process = Process {
+            id: id(PROCESS, 0),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 240,
+            frame_count: 480,
+            input_length: n as u32,
+            input: base,
+            output_length: 480 * 2 * 4,
+            output: out_ptr,
+        };
+        assert_eq!(
+            XApuEnqueueCommand(
+                handle,
+                (&raw const trim_process).cast(),
+                std::ptr::null_mut()
+            ),
+            S_OK
+        );
+
+        // Reset stream command
+        let reset = CommandId {
+            kind: RESET,
+            stream: 0,
+            sequence: 8,
+            options: 0,
+            context: 0x5678,
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const reset).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // ACTIVATE
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // PROCESS (trimmed)
+
+        // SAFETY: initialized above by XApuDequeueResult.
+        let trimmed = unsafe { result.assume_init() };
+        let (error, frames, length) = (trimmed.error, trimmed.frames, trimmed.output_length);
+        assert_eq!((error, frames, length), (S_OK, 480, 480 * 2 * 4));
+
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // RESET
+        // SAFETY: initialized above by XApuDequeueResult.
+        let reset_res = unsafe { result.assume_init() };
+        let (error, kind) = (reset_res.error, reset_res.id.kind);
+        assert_eq!((error, kind), (S_OK, RESET));
+
+        assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    #[test]
+    fn rejects_corrupted_opus_packet() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 4,
+            commands_per_stream: 4,
+            memory: 0x10_0000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+
+        let activate = Activate {
+            id: id(ACTIVATE, 1),
+            channels: 1,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        // Garbage bytes as packet
+        let corrupted = [0xFF, 0xEE, 0xDD, 0xCC, 0x00, 0x11, 0x22];
+        // SAFETY: copying corrupted bytes into connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(corrupted.as_ptr(), base, corrupted.len()) };
+        let out_ptr = base.wrapping_add(0x10000);
+
+        let process = Process {
+            id: id(PROCESS, 1),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: corrupted.len() as u32,
+            input: base,
+            output_length: 960 * 4,
+            output: out_ptr,
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const process).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // ACTIVATE
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK); // PROCESS (bad packet)
+
+        // SAFETY: initialized above by XApuDequeueResult.
+        let bad_res = unsafe { result.assume_init() };
+        let error = bad_res.error;
+        assert_eq!(error, BAD_PACKET);
+
+        assert_eq!(XApuDisconnect(handle), S_OK);
+    }
 }
